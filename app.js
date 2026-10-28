@@ -32,6 +32,8 @@
     assignmentId: null,
     assignmentName: null,
     messages: [],
+    pendingImages: [],
+    previewUrls: [],
     revealedThisVisit: false,
     busy: false,
     authTab: 'login'
@@ -41,6 +43,29 @@
   const queryCode = (params.get('sala') || '').trim().toUpperCase();
   const isPlaceholder = value => !value || value.includes('PEGA_AQUI_') || value.includes('YOUR_');
   const codeForUser = userId => `entre-regalos-last-room:${userId}`;
+  const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+  const MAX_IMAGES_PER_MESSAGE = 3;
+  const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+
+  function createUuid() {
+    if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = [...bytes].map(value => value.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+
+  function extensionForMimeType(mimeType) {
+    return ({ 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' })[mimeType] || null;
+  }
+
+  function clearPendingImages() {
+    state.previewUrls.forEach(url => URL.revokeObjectURL(url));
+    state.previewUrls = [];
+    state.pendingImages = [];
+  }
 
   function escapeHtml(value) {
     return String(value ?? '').replace(/[&<>"']/g, char => ({
@@ -435,7 +460,7 @@
     roomPollTimer = window.setInterval(async () => {
       if (!state.user || !state.room || state.busy || document.hidden) return;
       // No reemplazamos la pantalla mientras una persona está escribiendo una idea de regalo.
-      if (document.activeElement?.id === 'gift-message') return;
+      if (document.activeElement?.id === 'gift-message' || document.activeElement?.id === 'gift-images' || state.pendingImages.length) return;
       try {
         const previousStatus = state.room.status;
         const previousCount = state.participants.length;
@@ -513,9 +538,47 @@
         .from('gift_messages').select('id,author_id,message,created_at')
         .eq('room_id', state.room.id).order('created_at', { ascending: false }).limit(75);
       if (messagesError) throw messagesError;
+
+      const messageIds = (messages || []).map(message => message.id);
+      let imageRows = [];
+      if (messageIds.length) {
+        const { data: images, error: imagesError } = await state.client
+          .from('gift_message_images')
+          .select('id,message_id,storage_path,mime_type,size_bytes,created_at')
+          .eq('room_id', state.room.id)
+          .in('message_id', messageIds)
+          .order('created_at', { ascending: true });
+        if (imagesError) throw imagesError;
+        imageRows = images || [];
+      }
+
+      const signedUrlByPath = new Map();
+      if (imageRows.length) {
+        const { data: signedImages, error: signedImagesError } = await state.client
+          .storage.from('gift-images')
+          .createSignedUrls(imageRows.map(image => image.storage_path), 60 * 60);
+        if (signedImagesError) {
+          console.warn('No se pudieron generar enlaces temporales para las imágenes:', signedImagesError.message);
+        } else {
+          (signedImages || []).forEach(image => {
+            if (image.path && image.signedUrl) signedUrlByPath.set(image.path, image.signedUrl);
+          });
+        }
+      }
+
+      const imagesByMessage = new Map();
+      imageRows.forEach(image => {
+        if (!imagesByMessage.has(image.message_id)) imagesByMessage.set(image.message_id, []);
+        imagesByMessage.get(image.message_id).push({
+          ...image,
+          signed_url: signedUrlByPath.get(image.storage_path) || null
+        });
+      });
+
       state.messages = (messages || []).map(message => ({
         ...message,
-        author_name: profileMap.get(message.author_id)?.full_name || 'Participante'
+        author_name: profileMap.get(message.author_id)?.full_name || 'Participante',
+        images: imagesByMessage.get(message.id) || []
       }));
     } else {
       state.messages = [];
@@ -586,8 +649,13 @@
 
   function messagesHtml() {
     if (!state.messages.length) return '<div class="empty-state"><span class="empty-icon">💌</span>Aún no hay ideas de regalo.<br>Sé el primero en compartir una.</div>';
-    return `<div class="messages-list">${state.messages.map(message => `
-      <article class="message-card"><div class="message-meta"><span class="message-author">${escapeHtml(message.author_name)}</span><time class="message-date" datetime="${escapeHtml(message.created_at)}">${escapeHtml(niceDate(message.created_at))}</time></div><p class="message-body">${escapeHtml(message.message)}</p></article>`).join('')}</div>`;
+    return `<div class="messages-list">${state.messages.map(message => {
+      const bodyHtml = message.message ? `<p class="message-body">${escapeHtml(message.message)}</p>` : '';
+      const imagesHtml = (message.images || []).length ? `<div class="message-image-gallery">${message.images.map((image, index) => image.signed_url
+        ? `<a class="message-image-link" href="${escapeHtml(image.signed_url)}" target="_blank" rel="noopener noreferrer" aria-label="Abrir imagen adjunta ${index + 1}"><img src="${escapeHtml(image.signed_url)}" alt="Imagen adjunta ${index + 1}" loading="lazy"></a>`
+        : '<span class="message-image-unavailable">No se pudo cargar una imagen. Recarga la página para volver a intentarlo.</span>').join('')}</div>` : '';
+      return `<article class="message-card"><div class="message-meta"><span class="message-author">${escapeHtml(message.author_name)}</span><time class="message-date" datetime="${escapeHtml(message.created_at)}">${escapeHtml(niceDate(message.created_at))}</time></div>${bodyHtml}${imagesHtml}</article>`;
+    }).join('')}</div>`;
   }
 
   function dashboardHtml() {
@@ -606,7 +674,7 @@
         </div>
         <div class="dashboard-column">
           <section class="panel-card"><div class="mini-heading"><div><h3>💝 Ideas para regalar</h3><p class="muted">Publica una idea para ayudar a quien te saque.</p></div></div>
-            <form id="message-form" class="message-form"><label for="gift-message" class="muted">¿Qué te gustaría recibir?</label><textarea id="gift-message" class="message-input" name="message" maxlength="1000" rows="3" required placeholder="Ej. Me gustan las plantas, uso talla M, disfruto los libros..."></textarea><div class="message-composer-footer"><span id="message-count" class="char-counter">0 / 1000</span><button class="btn btn-primary" type="submit">Compartir idea ↑</button></div><p class="field-hint">Todos los participantes podrán leer tus mensajes. No escribas información privada.</p></form>
+            <form id="message-form" class="message-form"><label for="gift-message" class="muted">¿Qué te gustaría recibir?</label><textarea id="gift-message" class="message-input" name="message" maxlength="1000" rows="3" placeholder="Ej. Me gustan las plantas, uso talla M, disfruto los libros..."></textarea><div class="image-upload-row"><input id="gift-images" class="image-file-input" type="file" accept="image/jpeg,image/png,image/webp" multiple aria-label="Seleccionar hasta 3 imágenes"><label class="image-picker-btn" for="gift-images"><span aria-hidden="true">📎</span> Adjuntar fotos</label><span class="field-hint image-rules">Máx. 3 fotos por mensaje · 4 MB por foto</span></div><div id="image-previews" class="image-previews" aria-live="polite"></div><div class="message-composer-footer"><span id="message-count" class="char-counter">0 / 1000</span><button class="btn btn-primary" type="submit">Compartir idea ↑</button></div><p class="field-hint">Puedes enviar texto, fotos o ambos. Todos los participantes de esta sala podrán verlo. No compartas información privada.</p></form>
           </section>
           <section class="panel-card section-gap"><div class="mini-heading"><div><h3>Lo que quiere la familia</h3><p class="muted">Las ideas más recientes aparecen primero.</p></div></div><div id="messages-container">${messagesHtml()}</div></section>
         </div>
@@ -705,27 +773,121 @@
     }
   }
 
+  function renderImagePreviews() {
+    const container = document.getElementById('image-previews');
+    if (!container) return;
+    state.previewUrls.forEach(url => URL.revokeObjectURL(url));
+    state.previewUrls = [];
+    if (!state.pendingImages.length) {
+      container.innerHTML = '';
+      return;
+    }
+    container.innerHTML = `<div class="image-preview-grid">${state.pendingImages.map((file, index) => {
+      const url = URL.createObjectURL(file);
+      state.previewUrls.push(url);
+      return `<div class="image-preview-item"><img src="${url}" alt="Vista previa ${index + 1}: ${escapeHtml(file.name)}"><button type="button" class="image-remove-btn" data-remove-image="${index}" aria-label="Quitar imagen ${index + 1}" title="Quitar imagen">×</button><span>${escapeHtml(file.name)}</span></div>`;
+    }).join('')}</div><p class="field-hint">${state.pendingImages.length} de ${MAX_IMAGES_PER_MESSAGE} imágenes seleccionadas.</p>`;
+  }
+
+  function handleImageSelection(input) {
+    const files = Array.from(input.files || []);
+    input.value = '';
+    if (!files.length) return;
+    if (files.length > MAX_IMAGES_PER_MESSAGE) {
+      toast('Puedes adjuntar máximo 3 imágenes por mensaje. Envía las demás en otro mensaje.', 'error');
+      return;
+    }
+    const invalidType = files.find(file => !ALLOWED_IMAGE_TYPES.has(file.type));
+    if (invalidType) {
+      toast('Formato no admitido. Usa imágenes JPG, PNG o WebP.', 'error');
+      return;
+    }
+    const emptyFile = files.find(file => file.size <= 0);
+    if (emptyFile) {
+      toast('Una de las imágenes está vacía. Selecciona otro archivo.', 'error');
+      return;
+    }
+    const tooLarge = files.find(file => file.size > MAX_IMAGE_BYTES);
+    if (tooLarge) {
+      toast(`La imagen “${tooLarge.name}” supera el máximo de 4 MB.`, 'error');
+      return;
+    }
+    clearPendingImages();
+    state.pendingImages = files;
+    renderImagePreviews();
+  }
+
   async function submitGiftMessage(form) {
     if (state.busy) return;
     const textarea = form.querySelector('[name="message"]');
     const message = String(textarea?.value || '').trim();
-    if (!message) return toast('Escribe una idea antes de enviarla.', 'error');
+    const files = [...state.pendingImages];
+    if (!message && files.length === 0) return toast('Escribe una idea o adjunta al menos una imagen.', 'error');
     if (message.length > 1000) return toast('El mensaje debe tener máximo 1000 caracteres.', 'error');
-    setBusy(true, 'Compartiendo tu idea con la familia...');
+    if (files.length > MAX_IMAGES_PER_MESSAGE) return toast('Puedes adjuntar máximo 3 imágenes por mensaje.', 'error');
+
+    setBusy(true, files.length ? 'Subiendo tus fotos y compartiendo la idea...' : 'Compartiendo tu idea con la familia...');
+    const uploadedPaths = [];
+    let messageSaved = false;
     try {
-      const { error } = await state.client.from('gift_messages').insert({
-        room_id: state.room.id,
-        author_id: state.user.id,
-        message
-      });
-      if (error) throw error;
+      if (files.length) {
+        const messageId = createUuid();
+        const imageMetadata = [];
+        for (const file of files) {
+          if (!ALLOWED_IMAGE_TYPES.has(file.type) || file.size <= 0 || file.size > MAX_IMAGE_BYTES) {
+            throw new Error('Una de las imágenes no cumple el formato o el límite de 4 MB.');
+          }
+          const extension = extensionForMimeType(file.type);
+          if (!extension) throw new Error('Formato de imagen no admitido. Usa JPG, PNG o WebP.');
+          const storagePath = `${state.room.id}/${state.user.id}/${messageId}/${createUuid()}.${extension}`;
+          const { error: uploadError } = await state.client.storage
+            .from('gift-images')
+            .upload(storagePath, file, { cacheControl: '3600', contentType: file.type, upsert: false });
+          if (uploadError) throw uploadError;
+          uploadedPaths.push(storagePath);
+          imageMetadata.push({ storage_path: storagePath, mime_type: file.type, size_bytes: file.size });
+        }
+
+        const { error: messageError } = await state.client.rpc('create_gift_message_with_images', {
+          p_room_id: state.room.id,
+          p_message_id: messageId,
+          p_message: message || null,
+          p_images: imageMetadata
+        });
+        if (messageError) throw messageError;
+        messageSaved = true;
+      } else {
+        const { error: messageError } = await state.client.from('gift_messages').insert({
+          room_id: state.room.id,
+          author_id: state.user.id,
+          message
+        });
+        if (messageError) throw messageError;
+        messageSaved = true;
+      }
+
+      clearPendingImages();
       await loadRoomData();
       setBusy(false);
       renderRoom();
-      toast('Tu idea quedó compartida con la familia.');
+      toast(files.length ? 'Tu idea y tus fotos quedaron compartidas con la familia.' : 'Tu idea quedó compartida con la familia.');
     } catch (error) {
+      if (!messageSaved && uploadedPaths.length) {
+        try {
+          const { error: cleanupError } = await state.client.storage.from('gift-images').remove(uploadedPaths);
+          if (cleanupError) console.warn('No se pudieron limpiar todos los archivos de una carga fallida:', cleanupError.message);
+        } catch (cleanupError) {
+          console.warn('No se pudieron limpiar todos los archivos de una carga fallida:', cleanupError?.message || cleanupError);
+        }
+      }
       setBusy(false);
-      toast(formatError(error), 'error');
+      if (messageSaved) {
+        clearPendingImages();
+        renderRoom();
+        toast('El mensaje se guardó, pero no se pudo actualizar el chat. Recarga la página para ver el resultado.', 'error');
+      } else {
+        toast(formatError(error), 'error');
+      }
     }
   }
 
@@ -762,14 +924,23 @@
     state.assignmentId = null;
     state.assignmentName = null;
     state.messages = [];
+    clearPendingImages();
     state.revealedThisVisit = false;
     showAuth('login', 'Sesión cerrada correctamente.', 'success');
   }
 
   roomView.addEventListener('click', async event => {
-    const button = event.target.closest('[data-action]');
+    const button = event.target.closest('[data-action], [data-remove-image]');
     if (!button) return;
     const action = button.dataset.action;
+    if (button.hasAttribute('data-remove-image')) {
+      const index = Number(button.dataset.removeImage);
+      if (Number.isInteger(index) && index >= 0 && index < state.pendingImages.length) {
+        state.pendingImages.splice(index, 1);
+        renderImagePreviews();
+      }
+      return;
+    }
     if (action === 'close-room') await closeRoom();
     else if (action === 'spin') await beginSpin();
     else if (action === 'accept-assignment') await acceptAssignment();
@@ -786,6 +957,10 @@
       event.preventDefault();
       await submitGiftMessage(event.target);
     }
+  });
+
+  roomView.addEventListener('change', event => {
+    if (event.target.id === 'gift-images') handleImageSelection(event.target);
   });
 
   roomView.addEventListener('input', event => {

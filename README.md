@@ -12,6 +12,7 @@ Aplicación web estática para organizar salas de amigo secreto con HTML, CSS y 
 - Ruleta visual de unos cinco segundos. La animación no elige el resultado: muestra el resultado que ya quedó guardado en el servidor.
 - Privacidad a nivel de base de datos: cada usuario solo puede consultar su asignación.
 - Dashboard con participantes e ideas de regalo compartidas.
+- Chat de ideas compatible con texto y hasta 3 fotos por mensaje (4 MB por imagen), guardadas en un bucket privado de Supabase Storage.
 - Recuperación de contraseña por correo.
 - Enlaces de invitación del tipo `https://tuusuario.github.io/amigo-secreto-familiar/?sala=CODIGO12`.
 
@@ -21,7 +22,8 @@ Aplicación web estática para organizar salas de amigo secreto con HTML, CSS y 
 - `styles.css`: diseño adaptable a celular y computador, colores y animaciones.
 - `app.js`: navegación y comunicación con Supabase.
 - `config.js`: URL del proyecto Supabase y clave pública.
-- `supabase/schema.sql`: tablas, funciones seguras y políticas RLS.
+- `supabase/schema.sql`: tablas, funciones seguras y políticas RLS de la instalación base.
+- `supabase/add_gift_images.sql`: migración adicional para adjuntar fotos a las ideas de regalo.
 
 ---
 
@@ -44,8 +46,9 @@ El plan gratuito es adecuado para un uso familiar pequeño, pero sus límites y 
 3. Abre el archivo `supabase/schema.sql` de esta carpeta, copia todo su contenido y pégalo en el editor SQL.
 4. Pulsa **Run**.
 5. Confirma que la consulta termina sin errores. Este archivo crea las tablas y funciones necesarias, además de las políticas de seguridad.
+6. Para una instalación nueva, ejecuta también `supabase/add_gift_images.sql` para habilitar las fotos del chat. En una instalación que ya está funcionando, sigue solamente la sección **Actualización: habilitar fotos en el chat** que aparece a continuación.
 
-**Importante:** ejecuta el SQL antes de probar el registro en la página. El archivo está preparado para la primera instalación. Si más adelante modificas el esquema, aplica migraciones controladas en vez de borrar las tablas, porque al borrarlas perderías los datos.
+**Importante:** ejecuta el SQL antes de probar el registro en la página. El archivo `schema.sql` está preparado para la primera instalación. Si más adelante modificas el esquema, aplica migraciones controladas en vez de borrar las tablas, porque al borrarlas perderías los datos.
 
 ## Qué protege el SQL
 
@@ -54,6 +57,27 @@ El plan gratuito es adecuado para un uso familiar pequeño, pero sus límites y 
 - Las tablas tienen Row Level Security (RLS). No se puede leer la asignación de otro participante desde el navegador, aunque alguien intente consultar la API manualmente.
 - Los cambios sensibles (crear sala, unirse, cerrar, sortear y aceptar el resultado) pasan por funciones de base de datos.
 - El código del frontend no contiene la clave de administración `service_role`.
+
+## ACTUALIZACIÓN: habilitar fotos en el chat (instalación existente)
+
+Si Entre Regalos ya está funcionando y la base de datos ya tiene las tablas actuales, aplica únicamente la migración nueva; **no vuelvas a ejecutar `schema.sql` ni borres tablas**, porque no hace falta para esta mejora.
+
+1. En Supabase, abre **SQL Editor → New query**.
+2. Abre `supabase/add_gift_images.sql` de esta carpeta, copia todo el contenido y pégalo en la consulta.
+3. Pulsa **Run** y confirma que termine sin errores. La migración crea el bucket privado `gift-images`, los metadatos de fotos, sus políticas de acceso y la función segura que guarda cada mensaje con sus imágenes.
+4. En el repositorio de GitHub, reemplaza `app.js` y `styles.css` por los archivos de esta actualización. Sube también `supabase/add_gift_images.sql` y el `README.md` actualizado. Conserva tu `config.js` vigente.
+5. Espera a que GitHub Pages publique los cambios y recarga el sitio. Si el navegador conserva el código anterior, realiza una recarga forzada.
+6. Haz primero las pruebas de la sección **Prueba de fotos** al final de esta guía.
+
+La migración no modifica las salas, participantes, asignaciones ni mensajes de texto existentes. El bucket no es público: las imágenes se consultan mediante enlaces temporales y las políticas comprueban que la cuenta pertenezca a la sala. El límite de tres archivos por mensaje se valida en la interfaz y también en Storage, no solo mediante JavaScript.
+
+### Límites de imágenes
+
+- Máximo 3 imágenes por mensaje; pueden enviarse mensajes adicionales sin un límite extra en la interfaz.
+- Máximo 4 MiB (4.194.304 bytes) por imagen.
+- Formatos permitidos: JPG/JPEG, PNG y WebP.
+- El frontend valida los archivos, y Supabase Storage impone el máximo por archivo y los tipos permitidos.
+- El bucket usa enlaces firmados con duración limitada. Al volver a entrar o recargar el panel, la aplicación genera nuevos enlaces para las fotos.
 
 # PASO 3. Configurar el registro de usuarios
 
@@ -140,6 +164,20 @@ order by giver.full_name;
 ```
 
 Esta consulta es solo para la prueba privada del desarrollador. No muestres su resultado a los participantes.
+
+### Prueba de fotos
+
+Después de ejecutar la migración y publicar `app.js` y `styles.css`:
+
+1. Entra en una sala de prueba cuyo sorteo ya se haya realizado y abre el panel principal.
+2. Publica un mensaje solo de texto para comprobar que el flujo anterior siga funcionando.
+3. Adjunta una imagen JPG o PNG inferior a 4 MB con texto y envíala. Confirma que aparece en el chat.
+4. Repite con tres imágenes en un solo mensaje y luego con un segundo mensaje para comprobar que puedes seguir compartiendo fotos.
+5. Selecciona cuatro fotos a la vez y confirma que la aplicación lo rechace con un aviso. Prueba también un archivo de más de 4 MB y un formato no admitido.
+6. Abre la misma sala con otra cuenta participante y confirma que puede ver las imágenes. Entra después en otra sala para verificar que no puede ver ni acceder a las fotos de la primera.
+7. Abre la página en un celular, pulsa una foto publicada y confirma que se visualiza en una pestaña nueva.
+
+Si una carga falla antes de guardar el mensaje, el código intenta retirar los archivos subidos sin asociar. Los archivos que ya se publicaron quedan protegidos contra el borrado directo por el navegador.
 
 # Uso normal en familia
 
