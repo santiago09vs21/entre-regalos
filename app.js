@@ -552,18 +552,27 @@
         imageRows = images || [];
       }
 
+      // Generamos cada enlace por separado. createSignedUrls puede devolver errores
+      // por archivo dentro de su lista sin activar el error general; eso hacía que
+      // todas las imágenes aparecieran como no disponibles sin mostrar la causa.
       const signedUrlByPath = new Map();
       if (imageRows.length) {
-        const { data: signedImages, error: signedImagesError } = await state.client
-          .storage.from('gift-images')
-          .createSignedUrls(imageRows.map(image => image.storage_path), 60 * 60);
-        if (signedImagesError) {
-          console.warn('No se pudieron generar enlaces temporales para las imágenes:', signedImagesError.message);
-        } else {
-          (signedImages || []).forEach(image => {
-            if (image.path && image.signedUrl) signedUrlByPath.set(image.path, image.signedUrl);
-          });
-        }
+        await Promise.all(imageRows.map(async imageRow => {
+          const { data: signedImage, error: signedImageError } = await state.client
+            .storage.from('gift-images')
+            .createSignedUrl(imageRow.storage_path, 60 * 60);
+
+          if (signedImageError || !signedImage?.signedUrl) {
+            console.warn('No se pudo generar el enlace de la imagen:', {
+              path: imageRow.storage_path,
+              code: signedImageError?.statusCode || signedImageError?.status || null,
+              message: signedImageError?.message || 'Supabase no devolvió una URL firmada.'
+            });
+            return;
+          }
+
+          signedUrlByPath.set(imageRow.storage_path, signedImage.signedUrl);
+        }));
       }
 
       const imagesByMessage = new Map();
